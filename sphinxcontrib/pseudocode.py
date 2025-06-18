@@ -87,17 +87,22 @@ class Pseudocode(Directive):
 
 def render_mm_html(self, node, code, options, prefix='pseudocode',
                    imgcls=None, alt=None):
-    tag_template = """<pre id="{id}" style="display:hidden;">
+    tag_template = """<pre id="{id}" style="display:none;">
             {code}
         </pre>"""
-    self.body.append(tag_template.format(id=get_fignumber(self, node), code=self.encode(code)))
-    node['id'] = get_fignumber(self, node)
+    figure_id = get_fignumber(self, node)
+    if not figure_id:
+        # Generate a unique ID if get_fignumber returns empty
+        figure_id = f"pseudocode-{id(node)}"
+    self.body.append(tag_template.format(id=figure_id, code=self.encode(code)))
+    node['id'] = figure_id
 
 
 def write_katex_autorenderer_file(app, filename, dicts):
-    filename = os.path.join(
-        app.builder.srcdir, app._katex_static_path, filename
-    )
+    # Write to the actual static output path instead of temp directory
+    static_path = os.path.join(app.builder.outdir, '_static')
+    os.makedirs(static_path, exist_ok=True)
+    filename = os.path.join(static_path, filename)
     content = katex_autorenderer_content(app, dicts)
     with open(filename, 'w') as file:
         file.write(content)
@@ -109,14 +114,14 @@ def katex_autorenderer_content(app, dicts):
               {functions}
             }});''')
     functions = ''
-    for pairs in dicts:
+    for i, pairs in enumerate(dicts):
         if (pairs['id'] != ''):
-            parentId = int(pairs['id'])
-            if (parentId > 0):
-                parentId -= 1
+            # Use the index as caption count, but start from 0 to match pseudocode.js numbering
+            # pseudocode.js will increment this to get Algorithm 1, Algorithm 2, etc.
+            captionCount = i
             functions += jinja2.Template(PROOF_HTML_TITLE_TEMPLATE_VISIT).render(
                 id=pairs['id'],
-                captionCount=parentId,
+                captionCount=captionCount,
                 lineNumber=pairs['linenos']
             )
 
@@ -126,6 +131,36 @@ def katex_autorenderer_content(app, dicts):
     options = ''
     delimiters = ''
     return '\n'.join([prefix, options, delimiters, suffix, content])
+
+
+def config_inited(app, config):
+    """Add algorithm packages for LaTeX output and set default numfig format."""
+    # Set default numfig format for pcode if not specified
+    if hasattr(config, 'numfig_format'):
+        if config.numfig_format is None:
+            config.numfig_format = {}
+        config.numfig_format.setdefault('pcode', '%s')
+    
+    # Add algorithm packages for LaTeX output
+    if hasattr(config, 'latex_elements'):
+        if config.latex_elements is None:
+            config.latex_elements = {}
+        preamble = config.latex_elements.get('preamble', '')
+        algorithm_packages = r'''
+\usepackage{algorithm}
+\usepackage{algorithmic}
+% Add missing commands for compatibility
+\newcommand{\PROCEDURE}[2]{\STATE \textbf{procedure } \textsc{#1}(#2)}
+\newcommand{\ENDPROCEDURE}{\STATE \textbf{end procedure}}
+\newcommand{\CALL}[2]{\textsc{#1}(#2)}
+% Configure algorithm counter to reset per chapter and use hierarchical numbering
+\makeatletter
+\@addtoreset{algorithm}{chapter}
+\renewcommand{\thealgorithm}{\thechapter.\arabic{algorithm}}
+\makeatother
+'''
+        if algorithm_packages not in preamble:
+            config.latex_elements['preamble'] = preamble + algorithm_packages
 
 
 def builder_inited(app):
@@ -150,9 +185,14 @@ def install_js2_part2(app, pagename, templatename, context, doctree):
     dicts = []
     if doctree is not None:
         for node in doctree.traverse(pseudocodeContentNode):
-            pairs = {'id': node['id'],
+            node_id = node.get('id', '')
+            if not node_id:
+                # Generate a unique ID if not already set
+                node_id = f"pseudocode-{id(node)}"
+                node['id'] = node_id
+            pairs = {'id': node_id,
                      'linenos': True if 'linenos' in node else False,
-                     'parentId': node.parent.attributes.get('ids')[0]}
+                     'parentId': node.parent.attributes.get('ids')[0] if node.parent.attributes.get('ids') else ''}
             dicts.append(pairs)
         if len(dicts) > 0:
             filename_autorenderer_specific = filename_autorenderer.format(
@@ -197,23 +237,49 @@ class PseudocodeDomain(StandardDomain):
     directives = {"pseudocode": Pseudocode}
 
 
+def get_pseudocode_title(node):
+    """Title getter function for pseudocode nodes."""
+    # Look for a caption first
+    for child in node.children:
+        if isinstance(child, pseudocodeCaption):
+            caption_text = child.astext().strip()
+            if caption_text:
+                return caption_text
+    
+    # Look for algorithm caption in the content
+    for child in node.children:
+        if isinstance(child, pseudocodeContentNode):
+            code = child.get('code', '')
+            # Extract caption from \caption{...} 
+            import re
+            caption_match = re.search(r'\\caption\{([^}]+)\}', code)
+            if caption_match:
+                return caption_match.group(1)
+    
+    return "Algorithm"
+
+
 ################################################################################
 # HTML
 def get_fignumber(writer, node):
     """Compute and return the theorem number of `node`."""
     # Copied from the sphinx project: sphinx.writers.html.HTMLTranslator.add_fignumber()
-    if not isinstance(node.parent, pseudocode):
-        return ""
-    figure_id = node.parent["ids"][0]
-    key = "pseudocode"
-    if figure_id in writer.builder.fignumbers.get(key, {}):
-        return ".".join(map(str, writer.builder.fignumbers[key][figure_id]))
+    if isinstance(node, pseudocodeContentNode) and isinstance(node.parent, pseudocode):
+        parent = node.parent
+        if parent.get("ids"):
+            figure_id = parent["ids"][0]
+            key = "pcode"
+            if hasattr(writer.builder, 'fignumbers') and key in writer.builder.fignumbers:
+                if figure_id in writer.builder.fignumbers[key]:
+                    return ".".join(map(str, writer.builder.fignumbers[key][figure_id]))
     return ""
 
 
 def html_visit_stuff_node(self, node):
     """Enter :class:`pseudocode` in HTML builder."""
     self.body.append(self.starttag(node, "div", CLASS="pseudocode"))
+    # Add figure number to pseudocode
+    self.add_fignumber(node)
 
 
 def html_depart_stuff_node(self, node):
@@ -247,6 +313,76 @@ def html_depart_pseudocode_content_node(self, node):
     self.body.append("</div>")
 
 
+################################################################################
+# LaTeX
+def latex_visit_stuff_node(self, node):
+    """Enter :class:`pseudocode` in LaTeX builder."""
+    # Add figure number to pseudocode for LaTeX
+    if hasattr(self, 'add_fignumber'):
+        self.add_fignumber(node)
+
+
+def latex_depart_stuff_node(self, node):
+    """Leave :class:`pseudocode` in LaTeX builder."""
+    pass
+
+
+def latex_visit_caption_node(self, node):
+    """Enter :class:`CaptionNode` in LaTeX builder."""
+    pass
+
+
+def latex_depart_caption_node(self, node):
+    """Leave :class:`CaptionNode` in LaTeX builder."""
+    pass
+
+
+def latex_visit_pseudocode_content_node(self, node):
+    """Enter :class:`pseudocodeContentNode` in LaTeX builder."""
+    # For LaTeX, we output the raw LaTeX code and add labels for cross-referencing
+    self.body.append('\n')
+    
+    # Get the pseudocode node (parent) to access its IDs
+    parent_node = node.parent
+    code = node['code']
+    
+    # Add labels after the \caption command for proper algorithm numbering
+    if parent_node and parent_node.get("ids"):
+        # Find the \caption command and add labels after it
+        import re
+        caption_pattern = r'(\\caption\{[^}]+\})'
+        
+        def add_labels_after_caption(match):
+            caption = match.group(1)
+            labels = []
+            for node_id in parent_node["ids"]:
+                # Get document name for proper label format
+                if hasattr(parent_node, 'document') and hasattr(parent_node.document, 'attributes'):
+                    source_path = parent_node.document.attributes.get('source', '')
+                    # Convert Windows backslashes to forward slashes for LaTeX compatibility
+                    source_path = source_path.replace('\\', '/')
+                    docname = source_path.split('/')[-1].split('.')[0]
+                    if docname:
+                        full_label = f"{docname}:{node_id}"
+                    else:
+                        full_label = node_id
+                else:
+                    full_label = node_id
+                labels.append(f'\\label{{{full_label}}}')
+            return caption + '\n' + '\n'.join(labels)
+        
+        # Replace the caption with caption + labels
+        code = re.sub(caption_pattern, add_labels_after_caption, code)
+    
+    self.body.append(code)
+    self.body.append('\n')
+
+
+def latex_depart_pseudocode_content_node(self, node):
+    """Leave :class:`pseudocodeContentNode` in LaTeX builder."""
+    pass
+
+
 def setup(app):
     """Setup extension.
     """
@@ -254,20 +390,26 @@ def setup(app):
 
     app.add_enumerable_node(
         pseudocode,
-        "pseudocode",
+        "pcode",
+        title_getter=get_pseudocode_title,
         html=(html_visit_stuff_node, html_depart_stuff_node),
+        latex=(latex_visit_stuff_node, latex_depart_stuff_node),
     )
     app.add_node(
         pseudocodeCaption,
         html=(html_visit_caption_node, html_depart_caption_node),
+        latex=(latex_visit_caption_node, latex_depart_caption_node),
     )
     app.add_node(
         pseudocodeContentNode,
         html=(html_visit_pseudocode_content_node, html_depart_pseudocode_content_node),
+        latex=(latex_visit_pseudocode_content_node, latex_depart_pseudocode_content_node),
     )
 
     app.add_directive('pcode', Pseudocode)
-    app.config.numfig_format.setdefault('pseudocode', 'Algorithm %s')
+    # Allow users to customize format via numfig_format in conf.py
+    # Default will be handled by Sphinx if not specified
+    app.connect('config-inited', config_inited)
     app.connect('builder-inited', builder_inited)
     app.connect('html-page-context', install_js2_part2)
     app.connect('build-finished', builder_finished)
