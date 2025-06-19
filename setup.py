@@ -3,7 +3,7 @@
 import io
 from setuptools import setup, find_namespace_packages
 
-version = '0.7.0'
+version = '0.7.1'
 
 # read the contents of your README file
 from pathlib import Path
